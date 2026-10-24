@@ -10,7 +10,7 @@ REM ============================================================================
 setlocal enabledelayedexpansion
 
 set PROJECT=led_blink
-set SRC1=%PROJECT%_main.c
+set SRC1=main.c
 set SRC2=led.c
 set SRC3=key.c
 set SRC4=uart.c
@@ -18,7 +18,7 @@ set SRC5=eeprom.c
 set SRC6=adc.c
 set SRC7=beep.c
 set REL1=led.rel
-set REL2=%PROJECT%_main.rel
+set REL2=main.rel
 set REL3=key.rel
 set REL4=uart.rel
 set REL5=eeprom.rel
@@ -161,7 +161,7 @@ REM ====== Clean up intermediate files ======
 echo [STEP] Cleaning intermediate files...
 for %%x in (asm lst rst rel sym map lk mem) do (
     if exist "%PROJECT%.%%x"  del "%PROJECT%.%%x"
-    if exist "%PROJECT%_main.%%x" del "%PROJECT%_main.%%x"
+    if exist "main.%%x"        del "main.%%x"
     if exist "led.%%x"        del "led.%%x"
     if exist "key.%%x"        del "key.%%x"
     if exist "uart.%%x"       del "uart.%%x"

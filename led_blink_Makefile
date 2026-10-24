@@ -13,7 +13,7 @@ MCU      = stm8s103f3
 PROJECT  = led_blink
 
 # Source files
-SRCS     = $(PROJECT)_main.c led.c key.c
+SRCS     = main.c led.c key.c uart.c eeprom.c adc.c beep.c
 
 # Compiler flags
 CFLAGS   = -mstm8 --std-c99 -I./
@@ -34,10 +34,14 @@ CDB      = $(PROJECT).cdb
 all: $(IHX)
 
 $(IHX): $(SRCS)
-	$(CC) $(CFLAGS) -c $(PROJECT)_main.c
+	$(CC) $(CFLAGS) -c main.c
 	$(CC) $(CFLAGS) -c led.c
 	$(CC) $(CFLAGS) -c key.c
-	$(CC) $(CFLAGS) $(PROJECT)_main.rel led.rel key.rel -o $@
+	$(CC) $(CFLAGS) -c uart.c
+	$(CC) $(CFLAGS) -c eeprom.c
+	$(CC) $(CFLAGS) -c adc.c
+	$(CC) $(CFLAGS) -c beep.c
+	$(CC) $(CFLAGS) main.rel led.rel key.rel uart.rel eeprom.rel adc.rel beep.rel -o $@
 
 # Generate Intel HEX from IHX
 hex: $(IHX)
