@@ -1,0 +1,19 @@
+{
+    "configurations": [
+        {
+            "name": "STM8S SDCC",
+            "includePath": [
+                "${workspaceFolder}",
+                "C:\\Program Files\\SDCC\\include"
+            ],
+            "defines": [
+                "__SDCC=1",
+                "STM8S103"
+            ],
+            "compilerPath": "",
+            "cStandard": "c99",
+            "intelliSenseMode": "gcc-x86"
+        }
+    ],
+    "version": 4
+}
