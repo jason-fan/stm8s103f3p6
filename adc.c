@@ -1,109 +1,202 @@
 /**
- * adc.c - STM8S103F3P6 ADC1 single conversion on PC4 (AIN2)
+ * adc.c - STM8S103F3 ADC1 Driver Implementation
  *
- * Registers (STM8S103 datasheet DS5932, ADC1 base 0x5400; RM0016 bit map):
- *   ADC_CSR @ 0x5400  (EOC bit7, AWD bit6, EOCIE bit5, AWDIE bit4,
- *                      CH[3:0] channel select bits 3:0)
- *   ADC_CR1 @ 0x5401  (SPSEL[2:0] bits 6:4, CONT bit1, ADON bit0)
- *   ADC_CR2 @ 0x5402  (ALIGN bit3: 0 = right-aligned)
- *   ADC_DRH @ 0x5404  (data high byte: bits 9..2)
- *   ADC_DRL @ 0x5405  (data low bits 1..0)
- *
- * Channel mapping (low density, TSSOP20): AIN2 = PC4 (pin 14).
- * NOTE: PA1 is OSCIN only, NOT AIN1; channel 1 does not exist here.
- *
- * Single conversion (RM0016 24.5 / AN3023):
- *   - select the channel via CSR first (before power-on, as recommended)
- *   - first CR1.ADON=1 write powers the ADC up (0->1, no conversion)
- *   - second CR1.ADON=1 write (1->1) starts one conversion
- *   - wait EOC, then read DRH:DRL (EOC auto-clears on DR read)
- *
- * HISTORY OF THE FIX (2026-10-24):
- *   Previous code wrote "ADON" into ADC_CSR bit0, which is really CH[0]:
- *   that corrupted the selected channel from 2 to 3 (PD2/AIN3), so the
- *   reading never tracked PC4; and ADC_CR1=0x03 actually meant CONT=1,
- *   ADON=1, SPSEL=000 (/2), not "SPSEL=011" as the old comment claimed.
+ * Single-conversion mode: init selects channel + SPSEL,
+ * read starts one conversion and returns the 10-bit result.
  */
 
+#include <stdint.h>
 #include "adc.h"
 
-#define ADC_CSR  (*(volatile uint8_t *)0x5400)
-#define ADC_CR1  (*(volatile uint8_t *)0x5401)
-#define ADC_CR2  (*(volatile uint8_t *)0x5402)
-#define ADC_DRH  (*(volatile uint8_t *)0x5404)
-#define ADC_DRL  (*(volatile uint8_t *)0x5405)
+/* ========== GPIO Register Access ========== */
 
-#define ADC_CR1_ADON      0x01   /* bit0: ADC on / start conversion */
-#define ADC_CR1_CONT      0x02   /* bit1: continuous conversion */
-#define ADC_CR1_SPSEL     0x70   /* bits 6:4: prescaler selection */
-#define ADC_CR1_SPSEL_DIV6  0x30 /* SPSEL=011 -> fADC=fMASTER/6 */
-#define ADC_CR1_SPSEL_DIV8  0x40 /* SPSEL=100 -> fADC=fMASTER/8 = 2MHz@16MHz */
+#define GPIO_REG(port, off)     (*(volatile uint8_t *)((port) + (off)))
+#define GPIO_DDR(port)          GPIO_REG(port, 2)
+#define GPIO_CR1(port)          GPIO_REG(port, 3)
+#define GPIO_CR2(port)          GPIO_REG(port, 4)
 
-#define ADC_CSR_EOC  0x80   /* end of conversion */
-#define ADC_CSR_CH   0x0F   /* channel select bits [3:0] */
-#define ADC_CSR_STAT 0xF0   /* keep EOC/AWD/EOCIE/AWDIE when re-selecting */
+/* STM8S103 GPIO port base addresses */
+#define GPIO_PC                 0x500A
+#define GPIO_PD                 0x500F
 
-#define CLK_PCKENR2       (*(volatile uint8_t *)0x50C8)  /* NOTE: 0x50C7 is PCKENR1! */
-#define CLK_PCKENR2_ADC1  0x08   /* ADC1 clock enable (bit3) */
+/* ========== ADC Register Bit Masks ========== */
 
-#define GPIO_PC      0x500A
-#define PC_DDR       (*(volatile uint8_t *)(GPIO_PC + 2))
-#define PC_CR1       (*(volatile uint8_t *)(GPIO_PC + 3))
-#define PC_CR2       (*(volatile uint8_t *)(GPIO_PC + 4))
+#define ADC_CSR_EOC             (uint8_t)0x80
+#define ADC_CR1_ADON            (uint8_t)0x01
+#define ADC_CR1_CONT            (uint8_t)0x02
+#define ADC_CR1_SPSEL           (uint8_t)0x70
 
-#define ADC_CH_AIN2    2     /* PC4 -> AIN2 */
-#define ADC_EOC_TIMEOUT 100000  /* bounded poll budget, never hang */
+/* ========== ADC1 Peripheral Clock Gate ==========
+ * STM8S103: ADC1 clock is gated by CLK_PCKENR2 bit3 (ADC1EN, 0x08).
+ * (git HEAD / pre-OO code used 0x08; 0x01 was a wrong port of the
+ *  mask — it would enable a different peripheral, not ADC1.)
+ * uart.c only opens PCKENR1 (UART/TIM1/etc); without PCKENR2 bit3,
+ * every ADC1 register write is ignored, ADON never starts a conversion,
+ * EOC never sets -> adc_read() would spin forever. */
+#define CLK_PCKENR2             (*(volatile uint8_t *)0x50C8)
+#define CLK_PCKENR2_ADC1EN      (uint8_t)0x08
 
-void adc_init(void)
+/* EOC poll timeout: prevents adc_read() from hanging the main loop
+ * forever if the conversion never completes (clock gate closed / pin
+ * misconfigured). ~5000 polls is far beyond a normal 2-8us conversion. */
+#define ADC_EOC_TIMEOUT         5000U
+
+/* ========== Static Helpers ========== */
+
+/* Resolve AIN channel -> GPIO port base address */
+static uint16_t adc_ch_port(uint8_t ch)
 {
-    /* Enable ADC1 clock (CLK_PCKENR2 bit3; reset default is on,
-     * set explicitly for robustness). */
-    CLK_PCKENR2 |= CLK_PCKENR2_ADC1;
-
-    /* PC4 = analog input: DDR=0 (input), CR1=0 (no pull), CR2=0 */
-    PC_DDR &= (uint8_t)~0x10;
-    PC_CR1 &= (uint8_t)~0x10;
-    PC_CR2 &= (uint8_t)~0x10;
-
-    /* Select channel FIRST (CSR only; keep status bits). */
-    ADC_CSR = (uint8_t)((ADC_CSR & ADC_CSR_STAT) | ADC_CH_AIN2);
-
-    /* Single conversion (CONT=0), right-aligned (ALIGN=0),
-     * SPSEL=100 -> fADC = fMASTER/8 = 2MHz @ 16MHz master.
-     * Direct write while ADON=0: no conversion triggered. */
-    ADC_CR1 = ADC_CR1_SPSEL_DIV8;
-    ADC_CR2 = 0x00;               /* right-aligned */
-
-    /* Power up ADC: first ADON write (0->1, does NOT start conversion). */
-    ADC_CR1 |= ADC_CR1_ADON;
+    switch (ch) {
+        case ADC_CH_PC4:  return GPIO_PC;   /* AIN2 = PC4 */
+        case ADC_CH_PD2:  return GPIO_PD;   /* AIN3 = PD2 */
+        case ADC_CH_PD3:  return GPIO_PD;   /* AIN4 = PD3 */
+        case ADC_CH_PD5:  return GPIO_PD;   /* AIN5 = PD5 */
+        case ADC_CH_PD6:  return GPIO_PD;   /* AIN6 = PD6 */
+        default:           return 0;        /* invalid channel */
+    }
 }
 
-uint16_t adc_read_ch2(void)
+/* Resolve AIN channel -> GPIO pin number */
+static uint8_t adc_ch_pin(uint8_t ch)
 {
-    uint32_t i = 0;
-    uint16_t result = 0;
+    switch (ch) {
+        case ADC_CH_PC4:  return 4;
+        case ADC_CH_PD2:  return 2;
+        case ADC_CH_PD3:  return 3;
+        case ADC_CH_PD5:  return 5;
+        case ADC_CH_PD6:  return 6;
+        default:           return 0;
+    }
+}
 
-    /* Re-assert channel: touch CSR only (keep EOC/AWD/EOCIE/AWDIE),
-     * never touch CR1 here. */
-    ADC_CSR = (uint8_t)((ADC_CSR & ADC_CSR_STAT) | ADC_CH_AIN2);
+/* ========== Method Implementations ========== */
 
-    /* Start conversion: second ADON=1 write (1->1) on CR1.
-     * Note: RM0016 warns that ANY bit-manipulation on CR1 can start a
-     * new conversion once ADON reads as 1; that is exactly what we want. */
-    ADC_CR1 |= ADC_CR1_ADON;
+static void adc_init(ADC_t *self)
+{
+    uint16_t port = adc_ch_port(self->ch);
+    uint8_t  mask = (uint8_t)(1 << adc_ch_pin(self->ch));
 
-    /* Wait EOC with bounded timeout (a few us at 2MHz fADC). */
-    while (!(ADC_CSR & ADC_CSR_EOC)) {
-        if (++i >= ADC_EOC_TIMEOUT) break;
+    if (port == 0) {
+        return;   /* invalid channel, nothing to configure */
     }
 
-    /* Right-aligned 10-bit: DRH holds bits 9..2, DRL holds bits 1..0.
-     * Reading DRH:DRL clears EOC automatically. */
-    result = (uint16_t)(((uint16_t)ADC_DRH << 2) | (ADC_DRL & 0x03U));
-    return result;
+    /* Enable ADC1 peripheral clock FIRST (PCKENR2 bit0).
+     * Without this, all ADC register writes below are silently ignored. */
+    CLK_PCKENR2 |= CLK_PCKENR2_ADC1EN;
+
+    /* GPIO -> input floating: DDR=0, CR1=0, CR2=0 */
+    GPIO_DDR(port) &= (uint8_t)~mask;
+    GPIO_CR1(port) &= (uint8_t)~mask;
+    GPIO_CR2(port) &= (uint8_t)~mask;
+
+    /* CSR: select channel, preserve status bits (incl. EOC) */
+    ADC1_CSR = (ADC1_CSR & (uint8_t)0xF0) | (self->ch & 0x0F);
+
+    /* CR1: set SPSEL (mask 0x70), clear CONT (single conversion) */
+    ADC1_CR1 = (ADC1_CR1 & (uint8_t)~ADC_CR1_SPSEL)
+             | ((self->spsel << 4) & ADC_CR1_SPSEL);
+    ADC1_CR1 &= (uint8_t)~ADC_CR1_CONT;
+
+    /* Power up ADC now (ADON 0->1, no conversion triggered).
+     * Without this the FIRST adc_read() only powers up on its ADON
+     * write and the first EOC poll can time out (sentinel 0xFFFF). */
+    ADC1_CR1 |= ADC_CR1_ADON;
 }
 
-uint8_t adc_csr_raw(void)
+/* ========== Single Conversion (internal) ==========
+ * STM8S ADC1 (unlike STM32) starts a new single-mode conversion on a
+ * simple WRITE of 1 to ADON — no 0->1 edge required. Keep ADON high
+ * (ADC stays powered) between reads: clearing ADON first would power
+ * the ADC down and back up on every sample, and the re-powered
+ * conversion often never sets EOC -> timeout -> constant 0V readings.
+ * Returns 0xFFFF sentinel if EOC never sets within the timeout. */
+static uint16_t adc_convert_once(void)
 {
-    return ADC_CSR;
+    uint16_t guard = 0;
+
+    /* Clear EOC before starting a new conversion */
+    ADC1_CSR &= (uint8_t)~ADC_CSR_EOC;
+    /* Write 1 to ADON: start a new conversion (ADC stays powered) */
+    ADC1_CR1 |= ADC_CR1_ADON;
+    /* Wait for conversion complete (EOC), with timeout so a broken ADC
+     * clock / channel can never hang the main loop (which would also
+     * stop beep.update() and uart.tx_service() -> beep never stops). */
+    while ((ADC1_CSR & ADC_CSR_EOC) == 0) {
+        if (++guard >= ADC_EOC_TIMEOUT) {
+            return 0xFFFF;      /* timeout sentinel */
+        }
+    }
+    /* Merge 10-bit result (right-aligned): DRH holds bits 9..2,
+     * DRL holds bits 1..0. Correct formula: (DRH << 2) | (DRL & 0x03).
+     * NOTE: DO NOT use (DRH << 8 | DRL) & 0x3FF — that keeps only the
+     * top 2 + bottom 2 bits and silently drops the middle 6 bits,
+     * e.g. full-scale 1021 (0b1111111101) becomes 769 (0b1100000001). */
+    return (uint16_t)(((uint16_t)ADC1_DRH << 2) | (ADC1_DRL & 0x03U));
+}
+
+/* ========== Settling Delay ==========
+ * STM8 ADC1 samples its input for a FIXED 1 ADC clock cycle
+ * (~0.56us at SPSEL=7) - there is no programmable sampling time.
+ * Before starting a conversion we pause briefly so the external
+ * input network (potentiometer wiper, wiring, contact resistance,
+ * stray capacitance) has time to charge the ADC sample capacitor.
+ * Volatile loop on a 16MHz core: roughly 0.5-1ms. */
+static void adc_settle_delay(void)
+{
+    volatile uint16_t i;
+    for (i = 0; i < 3000; i++) {
+        __asm__("nop");
+    }
+}
+
+static uint16_t adc_read(ADC_t *self)
+{
+    uint32_t sum = 0;
+    uint16_t v;
+    uint8_t  i, n = (self->samples < 1) ? 1 : self->samples;
+
+    /* Settle the input before sampling (see adc_settle_delay) */
+    adc_settle_delay();
+
+    /* Average n consecutive conversions; a single-shot reading on an
+     * unstable input (pot wiper / wiring / contact resistance) jumps
+     * between quantization levels (e.g. 512/256), averaging restores
+     * a stable value close to the true DC level. */
+    for (i = 0; i < n; i++) {
+        v = adc_convert_once();
+        if (v == 0xFFFF) {
+            return 0x0000;      /* timeout sentinel -> report 0V */
+        }
+        sum += v;
+    }
+    return (uint16_t)((sum + (n >> 1)) / n);   /* rounded average */
+}
+
+static void adc_set_samples(ADC_t *self, uint8_t n)
+{
+    self->samples = (n < 1) ? 1 : n;
+}
+
+static void adc_power_down(ADC_t *self)
+{
+    (void)self;
+    /* ADON = 0: power down ADC */
+    ADC1_CR1 &= (uint8_t)~ADC_CR1_ADON;
+}
+
+/* ========== Constructor ========== */
+
+ADC_t ADC_Create(uint8_t ch, uint8_t spsel)
+{
+    ADC_t adc;
+
+    adc.ch        = ch;
+    adc.spsel     = spsel;
+    adc.samples   = ADC_DEFAULT_SAMPLES;   /* 8 = settle delay + averaging */
+    adc.init      = adc_init;
+    adc.read      = adc_read;
+    adc.setSamples= adc_set_samples;
+    adc.powerDown = adc_power_down;
+
+    return adc;
 }

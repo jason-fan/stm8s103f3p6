@@ -62,6 +62,7 @@ static LED_t led;                  /* file-level LED object (ISR + callback) */
 static KEY_t key;                  /* file-level KEY object PA3 (ISR) */
 static UART_t uart;                /* file-level UART object (main loop) */
 static Beep_t beep;                /* file-level BEEP object PD4 (main loop) */
+static ADC_t adc;                  /* file-level ADC1 object (main loop) */
 
 /* Global 1ms tick, incremented by TIM1 ISR (volatile for ISR/main share) */
 volatile uint16_t g_tick = 0;
@@ -150,9 +151,14 @@ void TIM1_UPD_OVF_TRG_BRK_IRQHandler(void) __interrupt(11)
 
     g_tick++;                        /* advance global 1ms tick */
 
-    /* Time-slice scheduling: non-blocking periodic events only */
+    /* Time-slice scheduling: non-blocking periodic events only.
+     * beep.update must live HERE (in the 1ms ISR), not in the main
+     * loop: a blocked main loop (e.g. a missing peripheral clock
+     * stalling an ADC wait) would otherwise freeze beep's auto-off
+     * counter and leave the buzzer ringing forever. */
     led.onTime(&led, g_tick);
     key.onTime(&key, g_tick);
+    beep.update(&beep);
 }
 
 /* ========== EXTI0..EXTI3 ISRs (per-port) ==========
@@ -201,7 +207,8 @@ int main(void)
     key.ondblclick   = &key_ondblclick;       /* PA3 double click */
     key.onlongpress  = &key_onlongpress;      /* PA3 long press */
     uart.init(&uart);                    /* UART1 115200 8N1, TX on PD5 (debug link) */
-    adc_init();                          /* ADC1 single conversion, AIN2 = PC4 */
+    adc = ADC_Create(ADC_CH_PC4, 7);   /* AIN2 = PC4 电位器, SPSEL=/9 (fADC≈1.78MHz) 采样时间更长, 配合平均滤波更稳 */
+    adc.init(&adc);                      /* ADC1 single conversion, AIN2 = PC4 */
     beep = BEEP_Create();
     beep.init(&beep);                    /* BEEP on PD4: LSI on, 1kHz off */
 
@@ -243,7 +250,6 @@ int main(void)
         /* Drain pending TX bytes (blocks on TXE, safe in main context:
          * TIM1 ISR may preempt it and enqueue more bytes meanwhile). */
         uart.tx_service(&uart);
-        beep.update(&beep);          /* ~1ms tick: auto-off timed beeps */
 
         /* UART RX echo: byte received via RX interrupt -> enqueue it back */
         if (uart.rx_flag) {
@@ -255,7 +261,7 @@ int main(void)
          * (V_mV = raw * 3300 / 1023), print only when the value
          * changes by more than ±5mV (hysteresis for LSB jitter). */
         if ((uint16_t)(g_tick - last_adc_tick) >= 100U) {
-            uint16_t adc_raw = adc_read_ch2();
+            uint16_t adc_raw = adc.read(&adc);
             uint16_t adc_mv  = (uint16_t)(((uint32_t)adc_raw * 3300U) / 1023U);
             uint16_t delta;
             last_adc_tick = g_tick;
